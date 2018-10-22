@@ -39,6 +39,8 @@ import (
 	"github.com/btcsuite/btcwallet/waddrmgr"
 	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"google.golang.org/grpc/status"
+	"sync/atomic"
 )
 
 // Public API version constants
@@ -104,22 +106,65 @@ type versionServer struct {
 
 // walletServer provides wallet services for RPC clients.
 type walletServer struct {
+	ready  uint32 // atomic
 	wallet *wallet.Wallet
 }
 
 // loaderServer provides RPC clients with the ability to load and close wallets,
 // as well as establishing a RPC connection to a btcd consensus server.
 type loaderServer struct {
+	ready  uint32 // atomic
 	loader    *wallet.Loader
 	activeNet *netparams.Params
 	rpcClient *chain.RPCClient
 	mu        sync.Mutex
 }
 
+// Singleton implementations of each service.  Not all services are immediately
+// usable.
+var (
+	versionService             versionServer
+	walletService              walletServer
+	loaderService              loaderServer
+)
+
+// RegisterServices registers implementations of each gRPC service and registers
+// it with the server.  Not all service are ready to be used after registration.
+func RegisterServices(server *grpc.Server) {
+	pb.RegisterVersionServiceServer(server, &versionService)
+	pb.RegisterWalletServiceServer(server, &walletService)
+	pb.RegisterWalletLoaderServiceServer(server, &loaderService)
+}
+
+var serviceMap = map[string]interface{}{
+	"walletrpc.VersionService":             &versionService,
+	"walletrpc.WalletService":              &walletService,
+	"walletrpc.WalletLoaderService":        &loaderService,
+}
+
+// ServiceReady returns nil when the service is ready and a gRPC error when not.
+func ServiceReady(service string) error {
+	s, ok := serviceMap[service]
+	if !ok {
+		return status.Errorf(codes.Unimplemented, "service %s not found", service)
+	}
+	type readyChecker interface {
+		checkReady() bool
+	}
+	ready := true
+	r, ok := s.(readyChecker)
+	if ok {
+		ready = r.checkReady()
+	}
+	if !ready {
+		return status.Errorf(codes.FailedPrecondition, "service %v is not ready", service)
+	}
+	return nil
+}
+
 // StartVersionService creates an implementation of the VersionService and
 // registers it with the gRPC server.
 func StartVersionService(server *grpc.Server) {
-	pb.RegisterVersionServiceServer(server, &versionServer{})
 }
 
 func (*versionServer) Version(ctx context.Context, req *pb.VersionRequest) (*pb.VersionResponse, error) {
@@ -134,8 +179,13 @@ func (*versionServer) Version(ctx context.Context, req *pb.VersionRequest) (*pb.
 // StartWalletService creates an implementation of the WalletService and
 // registers it with the gRPC server.
 func StartWalletService(server *grpc.Server, wallet *wallet.Wallet) {
-	service := &walletServer{wallet}
-	pb.RegisterWalletServiceServer(server, service)
+	walletService.wallet = wallet
+	if atomic.SwapUint32(&walletService.ready, 1) != 0 {
+		panic("service already started")
+	}
+}
+func (s *walletServer) checkReady() bool {
+	return atomic.LoadUint32(&s.ready) != 0
 }
 
 func (s *walletServer) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
@@ -703,9 +753,15 @@ func (s *walletServer) AccountNotifications(req *pb.AccountNotificationsRequest,
 // and registers it with the gRPC server.
 func StartWalletLoaderService(server *grpc.Server, loader *wallet.Loader,
 	activeNet *netparams.Params) {
+	loaderService.loader = loader
+	loaderService.activeNet = activeNet
+	if atomic.SwapUint32(&loaderService.ready, 1) != 0 {
+		panic("service already started")
+	}
+}
 
-	service := &loaderServer{loader: loader, activeNet: activeNet}
-	pb.RegisterWalletLoaderServiceServer(server, service)
+func (s *loaderServer) checkReady() bool {
+	return atomic.LoadUint32(&s.ready) != 0
 }
 
 func (s *loaderServer) CreateWallet(ctx context.Context, req *pb.CreateWalletRequest) (

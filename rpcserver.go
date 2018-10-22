@@ -136,6 +136,7 @@ func startRPCServers(walletLoader *wallet.Loader) (*grpc.Server, *legacyrpc.Serv
 			}
 			creds := credentials.NewServerTLSFromCert(&keyPair)
 			server = grpc.NewServer(grpc.Creds(creds))
+			rpcserver.RegisterServices(server)
 			rpcserver.StartVersionService(server)
 			rpcserver.StartWalletLoaderService(server, walletLoader, activeNet)
 			for _, lis := range listeners {
